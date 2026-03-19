@@ -32,6 +32,9 @@ python3 ue_signal_analyzer.py <logfile.hdf> --failures
 # RF optimization dashboard
 python3 ue_signal_analyzer.py <logfile.hdf> --rf
 
+# Interactive Q&A agent (no API key needed)
+python3 ue_signal_analyzer.py <logfile.hdf> --agent
+
 # All views at once
 python3 ue_signal_analyzer.py <logfile.hdf> --all
 ```
@@ -47,7 +50,8 @@ python3 ue_signal_analyzer.py <logfile.hdf> --all
 | `--mobility` | Mobility Analysis | Serving cell timeline, handovers, band usage, mode transitions |
 | `--states` | State Machine | RRC/NAS state transitions with durations and ASCII timeline bar |
 | `--rf` | RF Optimization | Signal quality analytics, throughput stats, cell statistics, RF recommendations |
-| `--all` | All Views | Show every view above |
+| `--agent` | Interactive Agent | Ask questions in plain English — signal, RACH, failures, throughput, etc. |
+| `--all` | All Views | Show every view above (except agent) |
 | `--csv [FILE]` | CSV Export | Export all events to CSV (default: `signaling_events.csv`) |
 
 ## Filters
@@ -77,6 +81,7 @@ ue_signal_analyzer.py <logfile>
   --mobility         Cell & handover analysis
   --states           RRC/NAS state machine view
   --rf               RF optimization dashboard
+  --agent            Interactive Q&A agent
   --all              Show all views
   --csv [OUTFILE]    Export to CSV
   --filter-tech {lte,nr}
@@ -84,6 +89,69 @@ ue_signal_analyzer.py <logfile>
   --time-range START END
   --no-color         Disable colors
   --verbose / -v     Verbose packet output
+```
+
+## Scripts
+
+| File | Description |
+|------|-------------|
+| `ue_signal_analyzer.py` | Main analysis tool — all views, filters, agent, CSV export |
+| `apple_log_parser.py` | Apple sysdiagnose parser — extracts cellular data from iOS `.logarchive` |
+| `../qcom_log_analyzer.py` | Core engine — Qualcomm DIAG binary parsing, UPER RRC decoding, RACH |
+| `../qcom_log_agent.py` | Claude API agent — ask questions via Claude (requires `ANTHROPIC_API_KEY`) |
+
+## Interactive Agent (`--agent`)
+
+Built-in Q&A agent that answers RF/network questions from parsed log data — no API key required. Parses your question, matches it to relevant topics, and returns data-driven answers.
+
+```bash
+python3 ue_signal_analyzer.py log.hdf --agent
+```
+
+```
+==============================================================
+  UE Log Interactive Agent
+==============================================================
+  Ask me anything about this log. I'll analyze the data and
+  give you an expert answer. Type 'q' to quit.
+
+  Examples:
+    > What is the signal quality?
+    > Are there any failures?
+    > Show me the cell info
+    > What should we fix?
+    > Is there interference?
+    > How is RACH performing?
+    > Give me a summary
+```
+
+### Supported Topics
+
+| Topic | Example Questions |
+|-------|-------------------|
+| Signal | "What is the RSRP?", "How is signal quality?", "Is coverage weak?" |
+| Cell | "What PCIs are seen?", "Which band?", "What frequency?" |
+| RACH | "How is RACH?", "Any Msg1/Msg2 issues?", "Preamble stats?" |
+| Handover | "Any handovers?", "Ping-pong?", "Mobility issues?" |
+| Failures | "Any drops?", "RLF count?", "Rejects?", "Reestablishments?" |
+| Throughput | "What's the speed?", "DL throughput?", "MCS stats?" |
+| Interference | "PCI collision?", "Mod-3 interference?", "Noise?" |
+| PHY | "BLER?", "Rank/MIMO?", "256QAM usage?", "RB allocation?" |
+| Beam | "SSB beam stats?", "Beam management?" |
+| QoS | "CQI?", "5QI?", "VoLTE?", "PDU session?", "Slice?" |
+| CA/DC | "Carrier aggregation?", "EN-DC?", "SCell?", "SCG?" |
+| Timing | "Timing advance?", "Latency?" |
+| Config | "SCS?", "TDD/FDD?", "Slot config?" |
+| Fix | "What should we fix?", "Recommendations?", "Next steps?" |
+
+### Claude API Agent (separate script)
+
+For more advanced natural-language analysis powered by Claude:
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+python3 ../qcom_log_agent.py log.hdf
+python3 ../qcom_log_agent.py log.hdf --verbose --model claude-sonnet-4-20250514
 ```
 
 ## Supported Log Codes
@@ -216,6 +284,7 @@ ue_signal_analyzer.py
 ├── MobilityAnalyzer
 ├── StateMachineRenderer
 ├── RFOptimizationView
+├── InteractiveAgent (--agent, keyword-routed Q&A)
 ├── CSVExporter
 └── main() with argparse
          │

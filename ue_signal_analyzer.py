@@ -3404,6 +3404,740 @@ class DiagnosticReport:
 # CSVExporter
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# InteractiveAgent — Ask questions about the log, get expert answers
+# ---------------------------------------------------------------------------
+
+class InteractiveAgent:
+    """Interactive Q&A agent that answers RF/network questions from parsed log data."""
+
+    def __init__(self, proc: LogProcessor, events: List[SignalingEvent]):
+        self.proc = proc
+        self.events = events
+        self.result = proc.result
+        self._precompute()
+
+    def _precompute(self) -> None:
+        """Pre-compute common metrics for fast answers."""
+        r = self.result
+        self.nr_sig = [s for s in r.signal_samples if s.tech == "NR"]
+        self.lte_sig = [s for s in r.signal_samples if s.tech == "LTE"]
+
+        self.nr_rsrp = [s.rsrp for s in self.nr_sig if s.rsrp is not None]
+        self.lte_rsrp = [s.rsrp for s in self.lte_sig if s.rsrp is not None]
+        self.nr_sinr = [s.sinr for s in self.nr_sig if s.sinr is not None]
+        self.lte_sinr = [s.sinr for s in self.lte_sig if s.sinr is not None]
+
+        self.rlf_count = sum(1 for a in r.anomalies if a.category == "rlf")
+        self.rejects = [e for e in self.events if "Reject" in e.message_type]
+        self.ho_count = sum(1 for e in self.events if "Reconfiguration" in e.message_type)
+        self.reest_count = sum(1 for e in self.events if "Reestablishment" in e.message_type)
+
+        # Cells
+        self.nr_pcis = set(s.pci for s in self.nr_sig if s.pci is not None)
+        self.lte_pcis = set(s.pci for s in self.lte_sig if s.pci is not None)
+
+        # RACH
+        self.nr_msg1 = [e for e in r.rach_events if e.tech == "NR" and e.msg_stage == "Msg1"]
+        self.nr_msg2 = [e for e in r.rach_events if e.tech == "NR" and e.msg_stage == "Msg2"]
+        self.lte_msg1 = [e for e in r.rach_events if e.tech == "LTE" and e.msg_stage == "Msg1"]
+        self.lte_msg2 = [e for e in r.rach_events if e.tech == "LTE" and e.msg_stage == "Msg2"]
+
+        # Band/ARFCN
+        self.nr_arfcn = next((s.earfcn for s in self.nr_sig if s.earfcn), None)
+        self.lte_arfcn = next((s.earfcn for s in self.lte_sig if s.earfcn), None)
+        self.nr_band = earfcn_to_band(self.nr_arfcn, "NR") if self.nr_arfcn else ""
+        self.lte_band = earfcn_to_band(self.lte_arfcn, "LTE") if self.lte_arfcn else ""
+
+    # ------------------------------------------------------------------
+    # Question routing
+    # ------------------------------------------------------------------
+    _TOPICS = {
+        "signal": ["signal", "rsrp", "rsrq", "sinr", "coverage", "weak", "strong", "bars", "quality"],
+        "cell": ["cell", "pci", "band", "arfcn", "earfcn", "frequency", "carrier", "serving", "neighbor"],
+        "rach": ["rach", "access", "msg1", "msg2", "msg3", "preamble", "random access"],
+        "handover": ["handover", "ho", "mobility", "ping-pong", "pingpong", "reselection", "a3", "b1"],
+        "failure": ["fail", "drop", "rlf", "reject", "reestablish", "issue", "problem", "error", "bad", "wrong"],
+        "throughput": ["throughput", "speed", "data rate", "mbps", "download", "upload", "mcs", "modulation"],
+        "interference": ["interference", "noise", "collision", "pci collision", "mod-3", "aggressor"],
+        "summary": ["summary", "overview", "status", "health", "how is", "what happened", "tell me", "everything"],
+        "fix": ["fix", "recommend", "action", "optimize", "improve", "suggestion", "what should", "next step"],
+        "beam": ["beam", "ssb", "beamform", "beam manage"],
+        "config": ["config", "scs", "slot", "duplex", "tdd", "fdd", "bandwidth"],
+        "qos": ["cqi", "5qi", "qci", "qos", "bearer", "quality indicator", "channel quality",
+                "volte", "vonr", "voice over", "ims", "slice", "slicing", "nssai", "sst",
+                "apn", "dnn", "pdu session"],
+        "phy": ["phy", "mcs", "bler", "rank", "mimo", "layer", "modulation", "256qam", "64qam", "qpsk", "rb"],
+        "timing": ["timing", "latency", "delay", "ta ", "timing advance", "rtt"],
+        "ca": ["carrier aggregation", " ca ", "ca?", "component carrier", "scell", "pcell", "pcc", "scc", "combo", "aggregat"],
+        "dc": ["endc", "en-dc", "nrdc", "nr-dc", "nsa", "dual connect", "anchor", "secondary", "scg", "mcg"],
+    }
+
+    def answer(self, question: str) -> str:
+        """Route a natural language question to the right analysis and return an answer."""
+        q = question.lower().strip()
+
+        if not q or q in ("q", "quit", "exit", "bye"):
+            return "__EXIT__"
+
+        # Match topics
+        matched = set()
+        for topic, keywords in self._TOPICS.items():
+            for kw in keywords:
+                if kw in q:
+                    matched.add(topic)
+
+        if not matched:
+            matched = {"summary"}  # default
+
+        parts: List[str] = []
+        if "summary" in matched or "fix" in matched:
+            parts.append(self._answer_summary())
+        if "signal" in matched:
+            parts.append(self._answer_signal())
+        if "cell" in matched or "config" in matched:
+            parts.append(self._answer_cell())
+        if "rach" in matched:
+            parts.append(self._answer_rach())
+        if "handover" in matched:
+            parts.append(self._answer_handover())
+        if "failure" in matched:
+            parts.append(self._answer_failures())
+        if "throughput" in matched:
+            parts.append(self._answer_throughput())
+        if "interference" in matched:
+            parts.append(self._answer_interference())
+        if "beam" in matched:
+            parts.append(self._answer_beam())
+        if "qos" in matched:
+            parts.append(self._answer_qos())
+        if "phy" in matched:
+            parts.append(self._answer_phy())
+        if "timing" in matched:
+            parts.append(self._answer_timing())
+        if "ca" in matched:
+            parts.append(self._answer_ca())
+        if "dc" in matched:
+            parts.append(self._answer_dc())
+        if "fix" in matched:
+            parts.append(self._answer_recommendations())
+
+        return "\n".join(p for p in parts if p)
+
+    # ------------------------------------------------------------------
+    # Answer generators
+    # ------------------------------------------------------------------
+    def _answer_summary(self) -> str:
+        r = self.result
+        lines = [f"{C.BOLD}{C.CYAN}Network Status Summary:{C.RESET}"]
+
+        # Mode
+        mode = "NR SA" if self.nr_sig and not self.lte_sig else "NSA" if self.nr_sig and self.lte_sig else "LTE"
+        parts = [mode]
+        if self.nr_band:
+            parts.append(f"NR {self.nr_band}")
+        if self.lte_band:
+            parts.append(f"LTE {self.lte_band}")
+        lines.append(f"  Network: {' + '.join(parts)}")
+
+        # Signal health
+        if self.nr_rsrp:
+            avg_r = mean(self.nr_rsrp)
+            health = "Good" if avg_r > -95 else "Fair" if avg_r > -105 else "Poor" if avg_r > -115 else "Very Poor"
+            lines.append(f"  NR Signal: {health} (avg RSRP {avg_r:.1f} dBm)")
+        if self.lte_rsrp:
+            avg_r = mean(self.lte_rsrp)
+            health = "Good" if avg_r > -95 else "Fair" if avg_r > -105 else "Poor"
+            lines.append(f"  LTE Signal: {health} (avg RSRP {avg_r:.1f} dBm)")
+
+        # Key issues
+        issues = []
+        if self.rlf_count > 0:
+            issues.append(f"{self.rlf_count} Radio Link Failures")
+        if self.rejects:
+            issues.append(f"{len(self.rejects)} RRC Rejects")
+        if self.lte_sinr and mean(self.lte_sinr) < 0:
+            issues.append("High interference (SINR < 0)")
+        if self.lte_msg1 and not self.lte_msg2:
+            issues.append("LTE RACH failing (0% Msg2)")
+
+        if issues:
+            lines.append(f"  {C.RED}Issues Found: {', '.join(issues)}{C.RESET}")
+        else:
+            lines.append(f"  {C.GREEN}No critical issues detected{C.RESET}")
+
+        lines.append(f"  Data: {len(r.signal_samples)} RF samples, {len(self.events)} signaling events")
+        return "\n".join(lines)
+
+    def _answer_signal(self) -> str:
+        lines = [f"{C.BOLD}Signal Quality:{C.RESET}"]
+        for tech, rsrp, sinr, label in [
+            ("NR", self.nr_rsrp, self.nr_sinr, self.nr_band),
+            ("LTE", self.lte_rsrp, self.lte_sinr, self.lte_band),
+        ]:
+            if not rsrp:
+                continue
+            lines.append(f"  {C.BOLD}{tech} ({label}):{C.RESET}")
+            lines.append(f"    RSRP: min={min(rsrp):.1f}  avg={mean(rsrp):.1f}  max={max(rsrp):.1f} dBm")
+            if sinr:
+                avg_s = mean(sinr)
+                color = C.GREEN if avg_s > 10 else C.YELLOW if avg_s > 0 else C.RED
+                lines.append(f"    SINR: min={min(sinr):.1f}  avg={color}{avg_s:.1f}{C.RESET}  max={max(sinr):.1f} dB")
+                if avg_s < 0:
+                    lines.append(f"    {C.RED}Warning: Avg SINR below 0 — severe interference{C.RESET}")
+        return "\n".join(lines)
+
+    def _answer_cell(self) -> str:
+        lines = [f"{C.BOLD}Cell Configuration:{C.RESET}"]
+        if self.nr_arfcn:
+            scs = nr_band_to_scs(self.nr_band) if self.nr_band else None
+            dup = NR_BAND_DUPLEX.get(self.nr_band, "")
+            parts = [f"Band {self.nr_band}" if self.nr_band else "", f"ARFCN {self.nr_arfcn}"]
+            if scs:
+                parts.append(f"SCS {scs}kHz")
+            if dup:
+                parts.append(dup)
+            lines.append(f"  NR: {' | '.join(p for p in parts if p)}")
+            lines.append(f"    PCIs: {sorted(self.nr_pcis)} ({len(self.nr_pcis)} cells)")
+        if self.lte_arfcn:
+            lines.append(f"  LTE: Band {self.lte_band} | EARFCN {self.lte_arfcn}")
+            lines.append(f"    PCIs: {sorted(self.lte_pcis)} ({len(self.lte_pcis)} cells)")
+        return "\n".join(lines)
+
+    def _answer_rach(self) -> str:
+        lines = [f"{C.BOLD}RACH Performance:{C.RESET}"]
+        for tech, m1, m2 in [("NR", self.nr_msg1, self.nr_msg2), ("LTE", self.lte_msg1, self.lte_msg2)]:
+            if not m1 and not m2:
+                continue
+            m1c, m2c = len(m1), len(m2)
+            rate = m2c / m1c * 100 if m1c else (100 if m2c else 0)
+            color = C.GREEN if rate >= 95 else C.YELLOW if rate >= 80 else C.RED
+            lines.append(f"  {tech}: Msg1={m1c}, Msg2={m2c} → {color}{rate:.1f}% success{C.RESET}")
+            if m1c > 0 and m2c == 0:
+                lines.append(f"    {C.RED}All RACH attempts failing — check preamble power in SIB2{C.RESET}")
+        if not self.nr_msg1 and not self.lte_msg1 and not self.nr_msg2 and not self.lte_msg2:
+            lines.append("  No RACH events in this log")
+        return "\n".join(lines)
+
+    def _answer_handover(self) -> str:
+        lines = [f"{C.BOLD}Mobility / Handover:{C.RESET}"]
+        lines.append(f"  Handovers: {self.ho_count}")
+        lines.append(f"  RLF Events: {self.rlf_count}")
+        lines.append(f"  Reestablishments: {self.reest_count}")
+        if self.rlf_count > 0 and self.ho_count == 0:
+            lines.append(f"  {C.RED}Issue: {self.rlf_count} RLF without any handover — thresholds too tight{C.RESET}")
+            lines.append(f"  Recommendation: Reduce timeToTrigger (TTT) or increase A2 threshold")
+        elif self.ho_count == 0 and self.rlf_count == 0:
+            lines.append(f"  No mobility events (stationary or single-cell)")
+        return "\n".join(lines)
+
+    def _answer_failures(self) -> str:
+        lines = [f"{C.BOLD}Failure Analysis:{C.RESET}"]
+        if self.rlf_count:
+            lines.append(f"  {C.RED}Radio Link Failures: {self.rlf_count}{C.RESET}")
+            for a in [a for a in self.result.anomalies if a.category == "rlf"][:3]:
+                lines.append(f"    {_ts(a.timestamp)}: {a.description}")
+        if self.rejects:
+            lines.append(f"  {C.RED}RRC Rejects: {len(self.rejects)}{C.RESET}")
+            for e in self.rejects[:3]:
+                lines.append(f"    {_ts(e.timestamp)}: {e.tech} {e.message_type}")
+        if self.lte_msg1 and not self.lte_msg2:
+            lines.append(f"  {C.RED}LTE RACH: {len(self.lte_msg1)} Msg1 sent, 0 Msg2 received{C.RESET}")
+            lines.append(f"    gNB/eNB not responding to preambles — check UL path loss or power config")
+        if not self.rlf_count and not self.rejects:
+            lines.append(f"  {C.GREEN}No failures detected in this log{C.RESET}")
+        return "\n".join(lines)
+
+    def _answer_throughput(self) -> str:
+        lines = [f"{C.BOLD}Throughput & PHY:{C.RESET}"]
+        for d in ["DL", "UL"]:
+            tp = [s.mbps for s in self.result.throughput_samples if s.direction == d and s.mbps > 0]
+            if tp:
+                lines.append(f"  {d}: avg={mean(tp):.1f}  peak={max(tp):.1f} Mbps")
+        if self.result.phy_samples:
+            for tech in ["NR", "LTE"]:
+                samples = [s for s in self.result.phy_samples if s.tech == tech]
+                if not samples:
+                    continue
+                mcs_vals = [s.mcs for s in samples if s.mcs is not None]
+                if mcs_vals:
+                    lines.append(f"  {tech} MCS: avg={mean(mcs_vals):.1f}, dominant={max(set(s.modulation for s in samples if s.mcs is not None), key=lambda m: sum(1 for s in samples if s.modulation == m))}")
+        if not self.result.throughput_samples and not self.result.phy_samples:
+            lines.append("  No throughput data in this log")
+        return "\n".join(lines)
+
+    def _answer_interference(self) -> str:
+        lines = [f"{C.BOLD}Interference Analysis:{C.RESET}"]
+        # PCI collision check
+        for tech, pcis in [("NR", self.nr_pcis), ("LTE", self.lte_pcis)]:
+            if len(pcis) < 2:
+                continue
+            mod3: Dict[int, List[int]] = defaultdict(list)
+            for p in pcis:
+                mod3[p % 3].append(p)
+            for m, group in mod3.items():
+                if len(group) > 1:
+                    lines.append(f"  {C.YELLOW}{tech} PCI collision risk (mod-3={m}): {group}{C.RESET}")
+
+        # SINR analysis
+        for tech, sinr in [("NR", self.nr_sinr), ("LTE", self.lte_sinr)]:
+            if sinr:
+                avg = mean(sinr)
+                if avg < 0:
+                    lines.append(f"  {C.RED}{tech}: Avg SINR {avg:.1f} dB — interference dominated{C.RESET}")
+                elif avg < 5:
+                    lines.append(f"  {C.YELLOW}{tech}: Avg SINR {avg:.1f} dB — moderate interference{C.RESET}")
+                else:
+                    lines.append(f"  {C.GREEN}{tech}: Avg SINR {avg:.1f} dB — acceptable{C.RESET}")
+        return "\n".join(lines)
+
+    def _answer_beam(self) -> str:
+        beam_samples = [s for s in self.nr_sig if s.beam_id is not None]
+        if not beam_samples:
+            return f"{C.BOLD}Beam Management:{C.RESET}\n  No NR beam data in this log"
+
+        beams: Dict[int, List[float]] = defaultdict(list)
+        for s in beam_samples:
+            if s.sinr is not None:
+                beams[s.beam_id].append(s.sinr)
+
+        lines = [f"{C.BOLD}NR Beam Management:{C.RESET}"]
+        lines.append(f"  Beams detected: {len(beams)} (SSB indices: {sorted(beams.keys())})")
+        if beams:
+            best = max(beams, key=lambda b: mean(beams[b]))
+            anchor = max(beams, key=lambda b: len(beams[b]))
+            lines.append(f"  Best beam: SSB {best} (avg SINR {mean(beams[best]):.1f} dB)")
+            lines.append(f"  Most used: SSB {anchor} ({len(beams[anchor])} samples)")
+            if best != anchor:
+                gap = mean(beams[best]) - mean(beams[anchor])
+                if gap > 3:
+                    lines.append(f"  {C.YELLOW}Gap: {gap:.1f} dB between best and most-used beam{C.RESET}")
+        return "\n".join(lines)
+
+    # QCI/5QI bearer name mappings (3GPP TS 23.203 / TS 23.501)
+    _QCI_NAMES = {
+        1: ("Conversational Voice (VoLTE)", "GBR", "100ms"),
+        2: ("Conversational Video", "GBR", "150ms"),
+        3: ("Real-time Gaming", "GBR", "50ms"),
+        4: ("Non-Conversational Video (Buffered)", "GBR", "300ms"),
+        5: ("IMS Signaling", "Non-GBR", "100ms"),
+        6: ("Video/TCP (Buffered Streaming)", "Non-GBR", "300ms"),
+        7: ("Voice/Video/Interactive Gaming", "Non-GBR", "100ms"),
+        8: ("Video/TCP (Premium)", "Non-GBR", "300ms"),
+        9: ("Video/TCP (Default Internet)", "Non-GBR", "300ms"),
+        65: ("Mission Critical PTT (MC-PTT)", "GBR", "75ms"),
+        66: ("Non-MC-PTT", "GBR", "100ms"),
+        69: ("Mission Critical Data", "Non-GBR", "60ms"),
+        70: ("V2X Messages", "GBR", "5ms"),
+    }
+    _5QI_NAMES = {
+        1: ("Conversational Voice (VoNR)", "GBR", "100ms"),
+        2: ("Conversational Video (Live)", "GBR", "150ms"),
+        3: ("Real-time Gaming", "GBR", "50ms"),
+        4: ("Non-Conversational Video", "GBR", "300ms"),
+        5: ("IMS Signaling", "Non-GBR", "100ms"),
+        6: ("Video/TCP (Buffered)", "Non-GBR", "300ms"),
+        7: ("Voice/Video/Interactive", "Non-GBR", "100ms"),
+        8: ("Video/TCP (Premium)", "Non-GBR", "300ms"),
+        9: ("Video/TCP (Default Internet)", "Non-GBR", "300ms"),
+        65: ("Mission Critical MC-PTT", "GBR", "75ms"),
+        66: ("Non-MC-PTT", "GBR", "100ms"),
+        69: ("Mission Critical Data", "Non-GBR", "60ms"),
+        70: ("V2X Messages", "GBR", "5ms"),
+        79: ("V2X Messages (high rel)", "GBR", "50ms"),
+        80: ("Low Latency eMBB", "Non-GBR", "10ms"),
+        82: ("Discrete Automation", "GBR", "10ms"),
+        83: ("Electricity Distribution", "GBR", "10ms"),
+        84: ("Intelligent Transport", "GBR", "30ms"),
+        85: ("Remote Control", "GBR", "5ms"),
+        86: ("Platooning", "GBR", "10ms"),
+    }
+    # SST (Slice/Service Type) mapping (3GPP TS 23.501)
+    _SST_NAMES = {
+        1: "eMBB (Enhanced Mobile Broadband)",
+        2: "URLLC (Ultra-Reliable Low-Latency)",
+        3: "MIoT (Massive IoT)",
+        4: "V2X (Vehicle to Everything)",
+        5: "HMTC (High-Performance Machine-Type)",
+    }
+
+    def _answer_qos(self) -> str:
+        r = self.result
+        has_nr = bool(self.nr_sig)
+        has_lte = bool(self.lte_sig)
+
+        # --- Detect call type from NAS events ---
+        nas_types = [e.msg_type.lower() for e in r.nas_events]
+        has_5gmm_reg = any("5gmm" in t and "registered" in t for t in nas_types)
+        has_esm = any("esm" in t for t in nas_types)
+        has_ims_ref = any("ims" in t for t in nas_types) or any("ims" in e.details.lower() for e in r.nas_events if e.details)
+
+        apns_detected = set()
+        for e in r.rrc_events:
+            d = e.details.lower() + " " + e.event.lower()
+            for apn in ["vzwinternet", "fast.t-mobile.com", "ims", "internet", "vzwadmin", "vzwapp"]:
+                if apn in d:
+                    apns_detected.add(apn)
+
+        volte_call = any("dedicated" in t or "voice" in t for t in nas_types)
+        vonr_call = any("pdu session" in t and "voice" in t for t in nas_types)
+        ims_active = has_ims_ref or "ims" in apns_detected or has_esm
+
+        # --- Call Type (top line — the key info) ---
+        lines = [f"{C.BOLD}Call / Bearer / Slicing Info:{C.RESET}"]
+
+        if volte_call:
+            lines.append(f"  {C.GREEN}{C.BOLD}Call Type: VoLTE (QCI 1 — Conversational Voice){C.RESET}")
+        elif vonr_call:
+            lines.append(f"  {C.GREEN}{C.BOLD}Call Type: VoNR (5QI 1 — Conversational Voice){C.RESET}")
+        else:
+            lines.append(f"  {C.BOLD}Call Type: DATA ONLY — No VoLTE/VoNR voice call detected{C.RESET}")
+            lines.append(f"  {C.DIM}(QCI 1 / 5QI 1 not present — no voice bearer established){C.RESET}")
+
+        # --- Active Bearers (only show what's actually there) ---
+        if has_lte:
+            lte_bearers = [(9, "Default Internet")]
+            if ims_active:
+                lte_bearers.append((5, "IMS Signaling"))
+            if volte_call:
+                lte_bearers.append((1, "VoLTE Voice"))
+
+            lines.append(f"\n  {C.BOLD}LTE Active Bearers:{C.RESET}")
+            for qci, desc in sorted(lte_bearers):
+                info = self._QCI_NAMES.get(qci, (desc, "N/A", "N/A"))
+                name, gbr_type, _pdb = info
+                tag = f" {C.CYAN}← VoLTE{C.RESET}" if qci == 1 else ""
+                lines.append(f"    QCI {qci}  {gbr_type:<8} {name:<40}{tag}")
+
+        if has_nr:
+            nr_bearers = [(9, "Default Internet")]
+            if ims_active or has_5gmm_reg:
+                nr_bearers.append((5, "IMS Signaling"))
+            if vonr_call:
+                nr_bearers.append((1, "VoNR Voice"))
+            if self.proc.fiveqi_values:
+                for _, qi in self.proc.fiveqi_values:
+                    if qi not in [b[0] for b in nr_bearers]:
+                        nr_bearers.append((qi, self._5QI_NAMES.get(qi, (f"5QI {qi}",))[0]))
+
+            lines.append(f"\n  {C.BOLD}NR Active PDU Sessions:{C.RESET}")
+            for qi, desc in sorted(nr_bearers):
+                info = self._5QI_NAMES.get(qi, (desc, "N/A", "N/A"))
+                name, gbr_type, _pdb = info
+                tag = f" {C.CYAN}← VoNR{C.RESET}" if qi == 1 else ""
+                lines.append(f"    5QI {qi}  {gbr_type:<8} {name:<40}{tag}")
+
+        # --- APNs ---
+        if apns_detected:
+            apn_map = {
+                "vzwinternet": "Data", "ims": "VoLTE/VoNR",
+                "fast.t-mobile.com": "Data", "internet": "Data",
+                "vzwadmin": "OMA-DM", "vzwapp": "App Services",
+            }
+            lines.append(f"\n  {C.BOLD}APN/DNN:{C.RESET}")
+            for apn in sorted(apns_detected):
+                lines.append(f"    {apn:<25} ({apn_map.get(apn, 'Unknown')})")
+
+        # --- Slicing ---
+        lines.append(f"\n  {C.BOLD}Network Slicing:{C.RESET}")
+        if has_5gmm_reg:
+            lines.append(f"    SST 1 — {self._SST_NAMES[1]} (Default)")
+            has_urllc = any("urllc" in e.details.lower() for e in r.nas_events if e.details)
+            if has_urllc:
+                lines.append(f"    SST 2 — {self._SST_NAMES[2]}")
+        elif has_lte:
+            lines.append(f"    {C.DIM}N/A — LTE does not support slicing{C.RESET}")
+        else:
+            lines.append(f"    {C.DIM}No slice info available{C.RESET}")
+
+        # --- CQI ---
+        if self.proc.cqi_samples:
+            cqi_vals = [c for _, c in self.proc.cqi_samples if c > 0]
+            if cqi_vals:
+                lines.append(f"\n  {C.BOLD}LTE CQI:{C.RESET} avg={mean(cqi_vals):.1f} range={min(cqi_vals)}-{max(cqi_vals)}")
+
+        return "\n".join(lines)
+
+    def _answer_phy(self) -> str:
+        lines = [f"{C.BOLD}PHY Layer Performance:{C.RESET}"]
+        if not self.result.phy_samples:
+            lines.append("  No PHY layer data (0xB822/0xB139 not present in this log)")
+            return "\n".join(lines)
+
+        for tech in ["NR", "LTE"]:
+            samples = [s for s in self.result.phy_samples if s.tech == tech and s.direction == "DL"]
+            if not samples:
+                continue
+            mcs = [s.mcs for s in samples if s.mcs is not None]
+            ranks = [s.rank for s in samples if s.rank is not None]
+            bler = [s.bler for s in samples if s.bler is not None]
+
+            lines.append(f"  {C.BOLD}{tech} DL ({len(samples)} samples):{C.RESET}")
+            if mcs:
+                # Modulation breakdown
+                mod_counts: Dict[str, int] = defaultdict(int)
+                for s in samples:
+                    if s.mcs is not None:
+                        mod_counts[s.modulation] += 1
+                total = sum(mod_counts.values())
+                lines.append(f"    MCS: avg={mean(mcs):.1f}  range={min(mcs)}-{max(mcs)}")
+                for mod_name in ["256QAM", "64QAM", "16QAM", "QPSK"]:
+                    cnt = mod_counts.get(mod_name, 0)
+                    if cnt > 0:
+                        lines.append(f"      {mod_name:<8}: {cnt / total * 100:.1f}%")
+            if ranks:
+                lines.append(f"    MIMO: avg rank={mean(ranks):.1f}  max={max(ranks)} layers")
+            if bler:
+                avg_bler = mean(bler) * 100
+                color = C.GREEN if avg_bler < 2 else C.YELLOW if avg_bler < 10 else C.RED
+                lines.append(f"    BLER: {color}{avg_bler:.2f}%{C.RESET}")
+        return "\n".join(lines)
+
+    def _answer_timing(self) -> str:
+        lines = [f"{C.BOLD}Timing / Latency:{C.RESET}"]
+        # Timing Advance from RACH events
+        ta_vals = [e.timing_advance for e in self.result.rach_events if e.timing_advance is not None]
+        if ta_vals:
+            lines.append(f"  Timing Advance: min={min(ta_vals)} avg={mean(ta_vals):.1f} max={max(ta_vals)}")
+            avg_dist = mean(ta_vals) * 78.12
+            lines.append(f"  Est. Distance: ~{avg_dist:.0f}m (TA x 78.12m)")
+        else:
+            lines.append("  No Timing Advance data in RACH events")
+
+        # RRC setup latency (from transaction pairing)
+        setup_events = [e for e in self.result.rrc_events if "Setup" in e.event and e.direction == "DL"]
+        if setup_events and len(setup_events) >= 2:
+            deltas = []
+            for i in range(len(setup_events) - 1):
+                d = (setup_events[i + 1].timestamp - setup_events[i].timestamp).total_seconds()
+                if 0 < d < 5:
+                    deltas.append(d * 1000)
+            if deltas:
+                lines.append(f"  RRC Setup interval: avg={mean(deltas):.0f}ms min={min(deltas):.0f}ms")
+        return "\n".join(lines)
+
+    def _answer_ca(self) -> str:
+        """Carrier Aggregation analysis — component carriers, combos, bands."""
+        lines = [f"{C.BOLD}Carrier Aggregation (CA) Analysis:{C.RESET}"]
+
+        for tech in ["LTE", "NR"]:
+            sig = self.nr_sig if tech == "NR" else self.lte_sig
+            if not sig:
+                continue
+
+            # Group by EARFCN
+            arfcn_data: Dict[int, Dict[str, Any]] = {}
+            for s in sig:
+                if s.earfcn is not None:
+                    if s.earfcn not in arfcn_data:
+                        band = earfcn_to_band(s.earfcn, tech)
+                        arfcn_data[s.earfcn] = {
+                            "band": band, "arfcn": s.earfcn,
+                            "samples": 0, "pcis": set(), "rsrp": [],
+                        }
+                    arfcn_data[s.earfcn]["samples"] += 1
+                    if s.pci is not None:
+                        arfcn_data[s.earfcn]["pcis"].add(s.pci)
+                    if s.rsrp is not None:
+                        arfcn_data[s.earfcn]["rsrp"].append(s.rsrp)
+
+            if len(arfcn_data) < 1:
+                continue
+
+            # Sort by sample count (PCell/PCC first)
+            sorted_carriers = sorted(arfcn_data.values(), key=lambda x: -x["samples"])
+
+            ca_label = "CA" if tech == "LTE" else "NR-CA"
+            num_cc = len(sorted_carriers)
+            lines.append(f"\n  {C.BOLD}{tech} {ca_label} — {num_cc} Component Carrier{'s' if num_cc > 1 else ''}:{C.RESET}")
+
+            # Build combo string
+            band_list = []
+            for i, cc in enumerate(sorted_carriers):
+                role = "PCC" if i == 0 else f"SCC{i}"
+                band_str = cc["band"] if cc["band"] else f"ARFCN {cc['arfcn']}"
+                pci_str = f"PCI {sorted(cc['pcis'])}" if cc["pcis"] else ""
+                avg_rsrp = f"RSRP avg={mean(cc['rsrp']):.1f}" if cc["rsrp"] else ""
+
+                band_list.append(cc["band"] or f"?({cc['arfcn']})")
+
+                color = C.GREEN if i == 0 else C.RESET
+                lines.append(
+                    f"    {color}{role:<5} {band_str:<10} ARFCN {cc['arfcn']:<10} "
+                    f"{pci_str:<20} {avg_rsrp}  ({cc['samples']} samples){C.RESET}"
+                )
+
+            # CA Combo string (e.g., "B13 + B2 + B66" or "n77 + n260")
+            if num_cc > 1:
+                combo = " + ".join(band_list)
+                lines.append(f"    {C.BOLD}CA Combo: {combo}{C.RESET}")
+
+                # Group by band for band-level summary
+                band_groups: Dict[str, int] = defaultdict(int)
+                for cc in sorted_carriers:
+                    b = cc["band"] or "Unknown"
+                    band_groups[b] += 1
+                band_summary = " + ".join(
+                    f"{cnt}x{b}" if cnt > 1 else b
+                    for b, cnt in sorted(band_groups.items())
+                )
+                if band_summary != combo:
+                    lines.append(f"    Band Summary: {band_summary}")
+
+                # Bandwidth estimate
+                if tech == "NR":
+                    nr_bw = {"n77": 100, "n78": 100, "n260": 100, "n261": 100, "n48": 40, "n41": 100}
+                    total_bw = sum(nr_bw.get(cc["band"], 20) for cc in sorted_carriers if cc["band"])
+                    lines.append(f"    Estimated Aggregate BW: ~{total_bw} MHz")
+                elif tech == "LTE":
+                    lte_bw = {"B2": 20, "B4": 20, "B5": 10, "B12": 10, "B13": 10,
+                              "B25": 20, "B26": 10, "B41": 20, "B46": 20, "B48": 20,
+                              "B66": 20, "B71": 20}
+                    total_bw = sum(lte_bw.get(cc["band"], 10) for cc in sorted_carriers if cc["band"])
+                    lines.append(f"    Estimated Aggregate BW: ~{total_bw} MHz")
+            else:
+                lines.append(f"    {C.DIM}Single carrier — no CA active{C.RESET}")
+
+        return "\n".join(lines)
+
+    def _answer_dc(self) -> str:
+        """EN-DC / NR-DC / Dual Connectivity call state."""
+        r = self.result
+        lines = [f"{C.BOLD}Dual Connectivity (EN-DC / NR-DC):{C.RESET}"]
+
+        has_lte = bool(self.lte_sig)
+        has_nr = bool(self.nr_sig)
+
+        # Determine DC mode
+        if has_lte and has_nr:
+            lines.append(f"  {C.BOLD}Mode: EN-DC (NSA — LTE anchor + NR secondary){C.RESET}")
+            # LTE anchor info
+            if self.lte_arfcn:
+                lines.append(f"  LTE Anchor: {self.lte_band} (EARFCN {self.lte_arfcn})")
+                pci = next((s.pci for s in self.lte_sig if s.pci and s.is_serving), None)
+                if pci:
+                    lines.append(f"    PCI: {pci}")
+                if self.lte_rsrp:
+                    lines.append(f"    RSRP: avg={mean(self.lte_rsrp):.1f} dBm")
+                if self.lte_sinr:
+                    avg_s = mean(self.lte_sinr)
+                    health = "Good" if avg_s > 10 else "Fair" if avg_s > 0 else "Poor (interference)"
+                    color = C.GREEN if avg_s > 10 else C.YELLOW if avg_s > 0 else C.RED
+                    lines.append(f"    Anchor Health: {color}{health} (SINR {avg_s:.1f}){C.RESET}")
+                    if avg_s < 0:
+                        lines.append(f"    {C.RED}WARNING: Poor LTE anchor will cause NR leg drops in NSA{C.RESET}")
+
+            # NR secondary info
+            if self.nr_arfcn:
+                lines.append(f"  NR Secondary: {self.nr_band} (NR-ARFCN {self.nr_arfcn})")
+                pci = next((s.pci for s in self.nr_sig if s.pci and s.is_serving), None)
+                if pci:
+                    lines.append(f"    PCI: {pci}")
+                if self.nr_rsrp:
+                    lines.append(f"    RSRP: avg={mean(self.nr_rsrp):.1f} dBm")
+
+            # NR-DC check: multiple NR frequency groups
+            nr_arfcns = set(s.earfcn for s in self.nr_sig if s.earfcn)
+            nr_bands = set(earfcn_to_band(a, "NR") for a in nr_arfcns if earfcn_to_band(a, "NR"))
+            if len(nr_bands) > 1:
+                lines.append(f"\n  {C.BOLD}NR-DC / Multi-band NR detected:{C.RESET}")
+                lines.append(f"    NR Bands: {sorted(nr_bands)}")
+                lines.append(f"    This may indicate NR-DC (dual NR connectivity) or NR CA")
+
+            # EN-DC setup events
+            endc_evts = [e for e in self.events if e.call_mode == "NSA"]
+            sa_evts = [e for e in self.events if e.call_mode == "SA"]
+            if endc_evts:
+                lines.append(f"  EN-DC Events: {len(endc_evts)} signaling events in NSA mode")
+            if sa_evts:
+                lines.append(f"  SA Events: {len(sa_evts)} signaling events in SA mode")
+
+            # SCG failures
+            scg = [a for a in r.anomalies if "scg" in a.description.lower()]
+            if scg:
+                lines.append(f"  {C.RED}SCG Failures: {len(scg)} — NR leg dropped while LTE stayed{C.RESET}")
+
+        elif has_nr and not has_lte:
+            lines.append(f"  {C.BOLD}Mode: NR SA (Standalone 5G — no LTE anchor){C.RESET}")
+            if self.nr_arfcn:
+                lines.append(f"  NR: {self.nr_band} (NR-ARFCN {self.nr_arfcn})")
+            # Multi-band NR = potential NR-DC
+            nr_arfcns = set(s.earfcn for s in self.nr_sig if s.earfcn)
+            nr_bands = set(earfcn_to_band(a, "NR") for a in nr_arfcns if earfcn_to_band(a, "NR"))
+            if len(nr_bands) > 1:
+                lines.append(f"  {C.BOLD}NR-DC possible — {len(nr_bands)} NR bands: {sorted(nr_bands)}{C.RESET}")
+
+        elif has_lte and not has_nr:
+            lines.append(f"  Mode: LTE only (no 5G connectivity)")
+            if self.lte_arfcn:
+                lines.append(f"  LTE: {self.lte_band} (EARFCN {self.lte_arfcn})")
+        else:
+            lines.append("  No cellular connectivity data")
+
+        return "\n".join(lines)
+
+    def _answer_recommendations(self) -> str:
+        lines = [f"{C.BOLD}Top Recommendations:{C.RESET}"]
+        n = 1
+        if self.rlf_count > 0 and self.ho_count == 0:
+            lines.append(f"  {n}. [HIGH] Reduce TTT — {self.rlf_count} RLF without handover")
+            n += 1
+        if self.lte_msg1 and not self.lte_msg2:
+            lines.append(f"  {n}. [HIGH] Increase RACH preamble power (-110 → -104 dBm)")
+            n += 1
+        if self.lte_sinr and mean(self.lte_sinr) < 0:
+            lines.append(f"  {n}. [HIGH] Address interference — LTE SINR avg {mean(self.lte_sinr):.1f} dB")
+            n += 1
+        if self.rejects:
+            lines.append(f"  {n}. [MEDIUM] Investigate {len(self.rejects)} RRC Rejects — capacity or access barring")
+            n += 1
+        if n == 1:
+            lines.append(f"  {C.GREEN}No critical actions needed{C.RESET}")
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # Interactive loop
+    # ------------------------------------------------------------------
+    def run(self) -> None:
+        """Run interactive Q&A session."""
+        print(f"\n{C.BOLD}{C.CYAN}{'=' * 60}")
+        print(f"  UE Log Analysis Agent")
+        print(f"{'=' * 60}{C.RESET}")
+        print(f"  Ask me anything about this log. I'll analyze the data and")
+        print(f"  give you an expert answer. Type 'q' to quit.\n")
+        print(f"  Examples:")
+        print(f"    > What is the signal quality?")
+        print(f"    > Are there any failures?")
+        print(f"    > Show me the cell info")
+        print(f"    > What should we fix?")
+        print(f"    > Is there interference?")
+        print(f"    > How is RACH performing?")
+        print(f"    > Give me a summary\n")
+
+        # Show quick summary first
+        print(self.answer("summary"))
+        print()
+
+        while True:
+            try:
+                q = input(f"{C.BOLD}{C.GREEN}  > {C.RESET}").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\n  Bye!")
+                break
+
+            if not q:
+                continue
+
+            response = self.answer(q)
+            if response == "__EXIT__":
+                print("  Bye!")
+                break
+
+            print()
+            print(response)
+            print()
+
+
 class CSVExporter:
     """Export signaling events to CSV."""
 
@@ -3483,6 +4217,8 @@ Examples:
     parser.add_argument("--rf", action="store_true",
                         help="RF optimization analysis (coverage, throughput, RACH, PCI, interference)")
     parser.add_argument("--all", action="store_true", help="Show all views")
+    parser.add_argument("--agent", action="store_true",
+                        help="Interactive Q&A agent — ask questions about the log in plain English")
     parser.add_argument("--csv", nargs="?", const="signaling_events.csv", metavar="OUTFILE",
                         help="Export events to CSV (default: signaling_events.csv)")
     parser.add_argument("--filter-tech", choices=["lte", "nr"], help="Filter by technology")
@@ -3578,6 +4314,11 @@ Examples:
     # CSV export
     if args.csv:
         CSVExporter().export(filtered, args.csv)
+
+    # Interactive agent
+    if args.agent:
+        agent = InteractiveAgent(proc, filtered)
+        agent.run()
 
 
 if __name__ == "__main__":
