@@ -404,7 +404,41 @@ class LogProcessor:
         self._nr_rrc_states: List[Tuple[datetime, str]] = []
 
     def process(self) -> List[SignalingEvent]:
-        """Full processing pipeline."""
+        """Full processing pipeline. Auto-detects Qualcomm DIAG vs Apple sysdiagnose."""
+        from apple_log_parser import is_apple_sysdiagnose
+
+        # Auto-detect: Apple sysdiagnose or Qualcomm DIAG?
+        if is_apple_sysdiagnose(self.filepath):
+            return self._process_apple()
+
+        return self._process_qualcomm()
+
+    def _process_apple(self) -> List[SignalingEvent]:
+        """Process Apple sysdiagnose .logarchive."""
+        from apple_log_parser import AppleLogParser
+
+        print(f"  [Apple sysdiagnose detected]")
+        parser = AppleLogParser(self.filepath, verbose=self.verbose)
+        result = parser.parse()
+
+        if not result.signal_samples and not result.rrc_events:
+            print(f"[WARN] No cellular data found in sysdiagnose")
+            return []
+
+        self.result = result
+
+        # Build RRC state timeline from registration events
+        self._build_rrc_state_timeline(result)
+
+        # Convert to unified SignalingEvent list
+        self._build_events(result)
+
+        # Sort by timestamp
+        self.events.sort(key=lambda e: e.timestamp)
+        return self.events
+
+    def _process_qualcomm(self) -> List[SignalingEvent]:
+        """Process Qualcomm DIAG binary log (.dlf/.hdf/.isf)."""
         # 1. Parse binary log
         parser = DLFParser(self.filepath, verbose=self.verbose)
         packets = parser.parse()
@@ -3313,12 +3347,18 @@ class DiagnosticReport:
         else:
             print(f"\n  {C.GREEN}  No critical issues detected.{C.RESET}")
 
-        # Confidence score
+        # Confidence score — based on data coverage and findings
         confidence = min(10, max(1, int(confidence_points / max(confidence_max, 1) * 10) + 3))
-        # Boost if we have good data coverage
+        # Boost for data coverage
+        if len(result.signal_samples) > 100:
+            confidence = min(10, confidence + 1)
         if len(result.signal_samples) > 1000:
             confidence = min(10, confidence + 1)
         if len(result.phy_samples) > 100:
+            confidence = min(10, confidence + 1)
+        if len(result.rrc_events) > 50:
+            confidence = min(10, confidence + 1)
+        if len(result.rach_events) > 5:
             confidence = min(10, confidence + 1)
 
         bar = "█" * confidence + "░" * (10 - confidence)
@@ -3433,7 +3473,7 @@ Examples:
   %(prog)s log.hdf --timeline --filter-msg Reestablishment
 """,
     )
-    parser.add_argument("logfile", help="Qualcomm DIAG binary log file (.dlf/.isf/.hdf)")
+    parser.add_argument("logfile", help="Qualcomm DIAG log (.dlf/.isf/.hdf) or Apple sysdiagnose directory/tar.gz")
     parser.add_argument("--summary", action="store_true", help="Dashboard overview (default)")
     parser.add_argument("--timeline", action="store_true", help="Full chronological message timeline")
     parser.add_argument("--ladder", action="store_true", help="Protocol ladder diagram")
@@ -3460,9 +3500,9 @@ Examples:
     else:
         C = _AnsiColor()
 
-    # Validate input file
-    if not os.path.isfile(args.logfile):
-        print(f"[ERROR] File not found: {args.logfile}")
+    # Validate input — file or directory (sysdiagnose)
+    if not os.path.exists(args.logfile):
+        print(f"[ERROR] Not found: {args.logfile}")
         sys.exit(1)
 
     # Process log

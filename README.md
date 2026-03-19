@@ -2,19 +2,26 @@
 
 LTE/NR signaling message analysis tool for network optimization engineers. Provides detailed signaling views for RRC/NAS/OTA troubleshooting — protocol timelines, ladder diagrams, failure analysis, mobility tracking, state machine views, and RF optimization dashboards.
 
-Built on top of `qcom_log_analyzer.py` which provides the binary parsing/decoding engine.
+Supports both **Qualcomm DIAG** binary logs (`.dlf`/`.isf`/`.hdf`) and **Apple sysdiagnose** (`.logarchive`/`.tar.gz`) with automatic format detection.
+
+Built on top of `qcom_log_analyzer.py` (Qualcomm) and `apple_log_parser.py` (Apple) which provide the parsing/decoding engines.
 
 ## Requirements
 
 - Python 3.8+
 - `qcom_log_analyzer.py` in the parent directory (`../qcom_log_analyzer.py`)
 - No external dependencies (standard library only)
+- For Apple sysdiagnose: macOS with `log show` command
 
 ## Quick Start
 
 ```bash
-# Default summary dashboard
+# Qualcomm DIAG log
 python3 ue_signal_analyzer.py <logfile.hdf>
+
+# Apple sysdiagnose (auto-detected)
+python3 ue_signal_analyzer.py <sysdiagnose.tar.gz>
+python3 ue_signal_analyzer.py <sysdiagnose.logarchive/>
 
 # Full protocol timeline
 python3 ue_signal_analyzer.py <logfile.hdf> --timeline
@@ -199,7 +206,9 @@ All-in-one RF engineering view with:
 ```
 ue_signal_analyzer.py
 ├── SignalingEvent (unified dataclass)
-├── LogProcessor (parse -> decode -> analyze -> unify)
+├── LogProcessor (auto-detect format, parse -> decode -> analyze -> unify)
+│   ├── _process_qualcomm()  — Qualcomm DIAG binary logs
+│   └── _process_apple()     — Apple sysdiagnose .logarchive
 ├── SummaryDashboard
 ├── TimelineRenderer
 ├── LadderRenderer
@@ -211,13 +220,13 @@ ue_signal_analyzer.py
 └── main() with argparse
          │
          v
-../qcom_log_analyzer.py
-├── DLFParser (binary .dlf/.isf/.hdf parsing)
-├── LTEAnalyzer (LTE packet decoding + UPER RRC + RACH)
-├── NR5GAnalyzer (NR packet decoding + UPER RRC)
+../qcom_log_analyzer.py              apple_log_parser.py
+├── DLFParser (.dlf/.isf/.hdf)       ├── AppleLogParser (.logarchive)
+├── LTEAnalyzer (UPER RRC + RACH)    ├── is_apple_sysdiagnose()
+├── NR5GAnalyzer (UPER RRC)          └── CommCenter/QMI log parsing
 ├── InsightEngine (anomaly detection)
-├── _decode_rrc_msg_from_pdu() (ASN.1 UPER decoder)
-└── Data classes (RRCEvent, NASEvent, SignalSample, ThroughputSample, etc.)
+├── _decode_rrc_msg_from_pdu()
+└── Data classes (RRCEvent, NASEvent, SignalSample, etc.)
 ```
 
 ## Examples
