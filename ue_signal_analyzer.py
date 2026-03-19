@@ -23,7 +23,8 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from statistics import mean
+from math import sqrt
+from statistics import mean, median
 from typing import Any, Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
@@ -45,6 +46,7 @@ from qcom_log_analyzer import (
     RRCEvent,
     NASEvent,
     SignalSample,
+    ThroughputSample,
     Anomaly,
     LOG_LTE_RRC_OTA,
     LOG_LTE_RRC_STATE,
@@ -895,19 +897,17 @@ class FailureAnalyzer:
         print(f"  {'TIME':<15} {'TECH':<5} {'LAYER':<10} {'MESSAGE':<35} {'CAUSE':<30} {'CONTEXT'}")
         print(f"  {'─' * 110}")
 
-        for i, f in enumerate(failures):
+        all_sorted = sorted(events, key=lambda e: e.timestamp)
+        event_index = {id(e): j for j, e in enumerate(all_sorted)}
+
+        for f in failures:
             cause = f.cause_text if f.cause_text else ""
             if f.cause_code is not None:
                 cause = f"#{f.cause_code}: {cause}"
 
             # Find preceding event for context
             context = ""
-            all_sorted = sorted(events, key=lambda e: e.timestamp)
-            idx = None
-            for j, e in enumerate(all_sorted):
-                if e is f:
-                    idx = j
-                    break
+            idx = event_index.get(id(f))
             if idx is not None and idx > 0:
                 prev = all_sorted[idx - 1]
                 context = f"after {prev.message_type}"
@@ -976,13 +976,13 @@ class MobilityAnalyzer:
         else:
             print(f"  {'TIME':<15} {'TECH':<5} {'PCI':<6} {'EARFCN':<8} {'BAND':<6} {'MODE':<6} {'EVENT'}")
             print(f"  {'─' * 80}")
-            seen: List[Tuple[int, str]] = []
+            seen: set = set()
             for e in cell_events:
                 key = (e.pci, e.tech)
                 marker = ""
                 if key not in seen:
                     marker = " [NEW CELL]"
-                    seen.append(key)
+                    seen.add(key)
                 earfcn_str = str(e.earfcn) if e.earfcn is not None else ""
                 print(
                     f"  {_ts(e.timestamp):<15} {e.tech:<5} {e.pci or '':<6} "
@@ -1165,7 +1165,7 @@ class StateMachineRenderer:
             self._print_state_bar(tech, timeline)
 
         # NAS state events
-        nas_states = [e for e in events if "State:" in e.message_type or "State:" in e.message_type]
+        nas_states = [e for e in events if "State:" in e.message_type]
         if nas_states:
             print(f"\n{C.BOLD}  NAS State Changes:{C.RESET}")
             print(f"    {'TIME':<15} {'TECH':<5} {'STATE'}")
@@ -1237,6 +1237,636 @@ class StateMachineRenderer:
 
 
 # ---------------------------------------------------------------------------
+# RFOptimizationView — all-in-one RF engineering dashboard
+# ---------------------------------------------------------------------------
+
+# RF quality thresholds
+_RSRP_BINS = [
+    ("Excellent", -80, float("inf")),
+    ("Good",      -100, -80),
+    ("Fair",      -110, -100),
+    ("Poor",      -120, -110),
+    ("No Cov",    float("-inf"), -120),
+]
+
+_SINR_BINS = [
+    ("Excellent", 20, float("inf")),
+    ("Good",      10, 20),
+    ("Fair",      0,  10),
+    ("Poor",      -5, 0),
+    ("Bad",       float("-inf"), -5),
+]
+
+_RSRQ_BINS = [
+    ("Excellent", -10, float("inf")),
+    ("Good",      -15, -10),
+    ("Fair",      -20, -15),
+    ("Poor",      float("-inf"), -20),
+]
+
+
+def _percentile(vals: List[float], pct: float) -> float:
+    """Simple percentile (nearest-rank)."""
+    if not vals:
+        return 0.0
+    s = sorted(vals)
+    k = int(len(s) * pct / 100)
+    k = min(k, len(s) - 1)
+    return s[k]
+
+
+def _stddev(vals: List[float]) -> float:
+    """Population standard deviation."""
+    if len(vals) < 2:
+        return 0.0
+    m = mean(vals)
+    return sqrt(sum((v - m) ** 2 for v in vals) / len(vals))
+
+
+def _bar(pct: float, width: int = 30) -> str:
+    """ASCII bar of given percentage."""
+    filled = int(pct / 100 * width)
+    return "█" * filled + "░" * (width - filled)
+
+
+class RFOptimizationView:
+    """Comprehensive RF optimization analysis — one view for all RF KPIs."""
+
+    def render(self, proc: LogProcessor, events: List[SignalingEvent]) -> None:
+        result = proc.result
+        if not result:
+            print("[WARN] No analysis result available.")
+            return
+
+        print(_section_header("RF OPTIMIZATION ANALYSIS"))
+
+        self._kpi_summary(proc, events, result)
+        self._coverage_distribution(result)
+        self._per_cell_rf(result)
+        self._throughput_vs_rf(result)
+        self._rach_performance(events)
+        self._pci_analysis(result)
+        self._interference_analysis(result)
+        self._coverage_gaps(result)
+        self._handover_analysis(events, result)
+
+    # ------------------------------------------------------------------ #
+    # Section 1: KPI Summary
+    # ------------------------------------------------------------------ #
+    def _kpi_summary(
+        self, proc: LogProcessor, events: List[SignalingEvent], result: AnalysisResult
+    ) -> None:
+        print(f"\n{C.BOLD}{C.CYAN}── RF KPI Summary ──{C.RESET}\n")
+
+        for tech in ["LTE", "NR"]:
+            samples = [s for s in result.signal_samples if s.tech == tech]
+            if not samples:
+                continue
+            rsrp = [s.rsrp for s in samples if s.rsrp is not None]
+            rsrq = [s.rsrq for s in samples if s.rsrq is not None]
+            sinr = [s.sinr for s in samples if s.sinr is not None]
+
+            print(f"  {C.BOLD}{tech} RF Measurements ({len(samples)} samples):{C.RESET}")
+            print(f"    {'Metric':<8} {'Min':>8} {'Avg':>8} {'Max':>8} {'StdDev':>8} {'P5':>8} {'P50':>8} {'P95':>8}")
+            print(f"    {'─' * 64}")
+            for name, vals, unit in [("RSRP", rsrp, "dBm"), ("RSRQ", rsrq, "dB"), ("SINR", sinr, "dB")]:
+                if vals:
+                    print(
+                        f"    {name:<8} {min(vals):>7.1f} {mean(vals):>7.1f} "
+                        f"{max(vals):>7.1f} {_stddev(vals):>7.1f} "
+                        f"{_percentile(vals, 5):>7.1f} {_percentile(vals, 50):>7.1f} "
+                        f"{_percentile(vals, 95):>7.1f} {unit}"
+                    )
+            print()
+
+        # Throughput KPIs
+        if result.throughput_samples:
+            print(f"  {C.BOLD}Throughput:{C.RESET}")
+            for direction in ["DL", "UL"]:
+                tp = [s.mbps for s in result.throughput_samples
+                      if s.direction == direction and s.mbps > 0]
+                if tp:
+                    print(
+                        f"    {direction:<4} Avg={mean(tp):>7.2f}  Peak={max(tp):>7.2f}  "
+                        f"P5={_percentile(tp, 5):>7.2f}  P50={_percentile(tp, 50):>7.2f}  "
+                        f"P95={_percentile(tp, 95):>7.2f} Mbps"
+                    )
+            print()
+
+        # Event KPIs
+        rach_events = [e for e in events if e.procedure_group == "RACH"]
+        rach_ok = sum(1 for e in rach_events if "Success" in e.message_type)
+        rach_fail = sum(1 for e in rach_events if "Fail" in e.message_type or "Abort" in e.message_type)
+        rach_total = rach_ok + rach_fail
+
+        setup_req = sum(1 for e in events if "RRCConnectionRequest" in e.message_type or "RRCSetupRequest" in e.message_type)
+        setup_ok = sum(1 for e in events if "RRCConnectionSetup" in e.message_type or "RRCSetupComplete" in e.message_type)
+
+        ho_count = sum(1 for e in events if "Reconfiguration" in e.message_type)
+        reest_count = sum(1 for e in events if "Reestablishment" in e.message_type and "Request" in e.message_type)
+        nas_rej = sum(1 for e in events if e.severity == "critical" and "NAS" in e.layer)
+
+        print(f"  {C.BOLD}Event KPIs:{C.RESET}")
+        if rach_total > 0:
+            print(f"    RACH Success Rate   : {rach_ok}/{rach_total} ({rach_ok / rach_total * 100:.1f}%)")
+        if setup_req > 0:
+            rate = setup_ok / setup_req * 100 if setup_req else 0
+            print(f"    RRC Setup Success   : {setup_ok}/{setup_req} ({rate:.1f}%)")
+        print(f"    Handovers (Reconfig): {ho_count}")
+        print(f"    RRC Reestablishments: {C.YELLOW}{reest_count}{C.RESET}")
+        print(f"    NAS Rejects         : {C.RED}{nas_rej}{C.RESET}")
+        print()
+
+    # ------------------------------------------------------------------ #
+    # Section 2: Coverage Distribution
+    # ------------------------------------------------------------------ #
+    def _coverage_distribution(self, result: AnalysisResult) -> None:
+        print(f"\n{C.BOLD}{C.CYAN}── RF Coverage Distribution ──{C.RESET}\n")
+
+        for tech in ["LTE", "NR"]:
+            samples = [s for s in result.signal_samples if s.tech == tech]
+            if not samples:
+                continue
+
+            print(f"  {C.BOLD}{tech}:{C.RESET}")
+            rsrp = [s.rsrp for s in samples if s.rsrp is not None]
+            sinr = [s.sinr for s in samples if s.sinr is not None]
+            rsrq = [s.rsrq for s in samples if s.rsrq is not None]
+
+            for label, vals, bins in [("RSRP", rsrp, _RSRP_BINS), ("SINR", sinr, _SINR_BINS), ("RSRQ", rsrq, _RSRQ_BINS)]:
+                if not vals:
+                    continue
+                total = len(vals)
+                print(f"    {label} Distribution:")
+                for name, lo, hi in bins:
+                    cnt = sum(1 for v in vals if lo <= v < hi)
+                    pct = cnt / total * 100
+                    color = C.GREEN if name == "Excellent" else C.GREEN if name == "Good" else C.YELLOW if name == "Fair" else C.RED
+                    print(f"      {color}{name:<10}{C.RESET} {_bar(pct)} {cnt:>6} ({pct:5.1f}%)")
+                print()
+
+    # ------------------------------------------------------------------ #
+    # Section 3: Per-Cell RF Performance
+    # ------------------------------------------------------------------ #
+    def _per_cell_rf(self, result: AnalysisResult) -> None:
+        print(f"\n{C.BOLD}{C.CYAN}── Per-Cell RF Performance ──{C.RESET}\n")
+
+        # Group signal samples by (tech, pci)
+        cells: Dict[Tuple[str, int], List[SignalSample]] = defaultdict(list)
+        for s in result.signal_samples:
+            if s.pci is not None:
+                cells[(s.tech, s.pci)].append(s)
+
+        if not cells:
+            print("  (no per-cell data available)")
+            return
+
+        print(
+            f"  {'Tech':<5} {'PCI':<6} {'Band':<6} {'EARFCN':<8} {'#Samp':>6}  "
+            f"{'RSRP min':>9} {'avg':>7} {'max':>7}  "
+            f"{'SINR min':>9} {'avg':>7} {'max':>7}"
+        )
+        print(f"  {'─' * 95}")
+
+        for (tech, pci), samps in sorted(cells.items(), key=lambda x: -len(x[1])):
+            rsrp = [s.rsrp for s in samps if s.rsrp is not None]
+            sinr = [s.sinr for s in samps if s.sinr is not None]
+            earfcn = next((s.earfcn for s in samps if s.earfcn is not None), None)
+            band = earfcn_to_band(earfcn, tech) if earfcn is not None else ""
+            earfcn_str = str(earfcn) if earfcn is not None else ""
+
+            rsrp_str = f"{min(rsrp):>8.1f} {mean(rsrp):>7.1f} {max(rsrp):>7.1f}" if rsrp else f"{'N/A':>8} {'':>7} {'':>7}"
+            sinr_str = f"{min(sinr):>8.1f} {mean(sinr):>7.1f} {max(sinr):>7.1f}" if sinr else f"{'N/A':>8} {'':>7} {'':>7}"
+
+            # Color by average RSRP
+            color = C.RESET
+            if rsrp:
+                avg_r = mean(rsrp)
+                if avg_r < -120:
+                    color = C.RED
+                elif avg_r < -110:
+                    color = C.YELLOW
+
+            print(f"  {color}{tech:<5} {pci:<6} {band:<6} {earfcn_str:<8} {len(samps):>6}  {rsrp_str}  {sinr_str}{C.RESET}")
+
+        print()
+
+    # ------------------------------------------------------------------ #
+    # Section 4: Throughput vs RF Correlation
+    # ------------------------------------------------------------------ #
+    def _throughput_vs_rf(self, result: AnalysisResult) -> None:
+        if not result.throughput_samples or not result.signal_samples:
+            return
+
+        print(f"\n{C.BOLD}{C.CYAN}── Throughput vs RF Correlation ──{C.RESET}\n")
+
+        # Build sorted signal timeline for quick nearest-neighbor lookup
+        sig_sorted = sorted(result.signal_samples, key=lambda s: s.timestamp)
+        sig_times = [s.timestamp for s in sig_sorted]
+
+        rsrp_ranges = [
+            ("> -80",  -80, float("inf")),
+            ("-100..-80", -100, -80),
+            ("-110..-100", -110, -100),
+            ("< -110", float("-inf"), -110),
+        ]
+
+        sinr_ranges = [
+            ("> 20",   20, float("inf")),
+            ("10..20", 10, 20),
+            ("0..10",  0,  10),
+            ("< 0",    float("-inf"), 0),
+        ]
+
+        for direction in ["DL", "UL"]:
+            tp_samples = [s for s in result.throughput_samples
+                          if s.direction == direction and s.mbps > 0]
+            if not tp_samples:
+                continue
+
+            # Map each throughput sample to nearest signal sample
+            tp_with_rf: List[Tuple[ThroughputSample, SignalSample]] = []
+            for tp in tp_samples:
+                idx = self._bisect_nearest(sig_times, tp.timestamp)
+                if idx is not None:
+                    sig = sig_sorted[idx]
+                    delta = abs((sig.timestamp - tp.timestamp).total_seconds())
+                    if delta < 5.0:  # within 5 seconds
+                        tp_with_rf.append((tp, sig))
+
+            if not tp_with_rf:
+                continue
+
+            print(f"  {C.BOLD}{direction} Throughput by RSRP:{C.RESET}")
+            print(f"    {'RSRP Range':<14} {'Samples':>8} {'Avg Mbps':>10} {'P50 Mbps':>10} {'P95 Mbps':>10}")
+            print(f"    {'─' * 55}")
+            for name, lo, hi in rsrp_ranges:
+                mbps_vals = [tp.mbps for tp, sig in tp_with_rf
+                             if sig.rsrp is not None and lo <= sig.rsrp < hi]
+                if mbps_vals:
+                    print(
+                        f"    {name:<14} {len(mbps_vals):>8} {mean(mbps_vals):>10.2f} "
+                        f"{_percentile(mbps_vals, 50):>10.2f} {_percentile(mbps_vals, 95):>10.2f}"
+                    )
+            print()
+
+            print(f"  {C.BOLD}{direction} Throughput by SINR:{C.RESET}")
+            print(f"    {'SINR Range':<14} {'Samples':>8} {'Avg Mbps':>10} {'P50 Mbps':>10} {'P95 Mbps':>10}")
+            print(f"    {'─' * 55}")
+            for name, lo, hi in sinr_ranges:
+                mbps_vals = [tp.mbps for tp, sig in tp_with_rf
+                             if sig.sinr is not None and lo <= sig.sinr < hi]
+                if mbps_vals:
+                    print(
+                        f"    {name:<14} {len(mbps_vals):>8} {mean(mbps_vals):>10.2f} "
+                        f"{_percentile(mbps_vals, 50):>10.2f} {_percentile(mbps_vals, 95):>10.2f}"
+                    )
+            print()
+
+    @staticmethod
+    def _bisect_nearest(times: List[datetime], target: datetime) -> Optional[int]:
+        """Find index of nearest timestamp using binary search."""
+        if not times:
+            return None
+        lo, hi = 0, len(times) - 1
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if times[mid] < target:
+                lo = mid + 1
+            else:
+                hi = mid
+        # Check lo and lo-1 for closest
+        best = lo
+        if lo > 0:
+            if abs(times[lo - 1] - target) < abs(times[lo] - target):
+                best = lo - 1
+        return best
+
+    # ------------------------------------------------------------------ #
+    # Section 5: RACH Performance
+    # ------------------------------------------------------------------ #
+    def _rach_performance(self, events: List[SignalingEvent]) -> None:
+        rach_events = [e for e in events if e.procedure_group == "RACH"]
+        if not rach_events:
+            return
+
+        print(f"\n{C.BOLD}{C.CYAN}── RACH Performance ──{C.RESET}\n")
+
+        success = [e for e in rach_events if "Success" in e.message_type]
+        failed = [e for e in rach_events if "Fail" in e.message_type]
+        aborted = [e for e in rach_events if "Abort" in e.message_type]
+        contention_based = [e for e in rach_events if "Contention-Based" in e.message_type]
+        contention_free = [e for e in rach_events if "Contention-Free" in e.message_type]
+
+        total = len(success) + len(failed) + len(aborted)
+        print(f"  Total RACH Attempts : {total}")
+        print(f"  {C.GREEN}Success             : {len(success)}{C.RESET}")
+        print(f"  {C.RED}Failed              : {len(failed)}{C.RESET}")
+        print(f"  {C.YELLOW}Aborted             : {len(aborted)}{C.RESET}")
+        if total > 0:
+            print(f"  Success Rate        : {len(success) / total * 100:.1f}%")
+        print(f"  Contention-Based    : {len(contention_based)}")
+        print(f"  Contention-Free     : {len(contention_free)}")
+
+        # Extract Timing Advance values from event message text
+        ta_values: List[int] = []
+        for e in rach_events:
+            msg = e.message_type
+            if "TA=" in msg:
+                try:
+                    ta_str = msg.split("TA=")[1].split(",")[0].split(")")[0].strip()
+                    ta_values.append(int(ta_str))
+                except (ValueError, IndexError):
+                    pass
+
+        if ta_values:
+            print(f"\n  {C.BOLD}Timing Advance:{C.RESET}")
+            print(f"    Min TA    : {min(ta_values)}")
+            print(f"    Avg TA    : {mean(ta_values):.1f}")
+            print(f"    Max TA    : {max(ta_values)}")
+            # LTE: TA * 16 * Ts ≈ TA * 78.12m (round-trip), distance = TA * 78.12 / 2
+            # Simplified: distance ≈ TA * 149.2m / Nta (for LTE TA index)
+            avg_dist_m = mean(ta_values) * 78.12
+            max_dist_m = max(ta_values) * 78.12
+            print(f"    Est. Dist : avg ~{avg_dist_m:.0f}m  max ~{max_dist_m:.0f}m  (LTE TA*78.12m)")
+
+        print()
+
+    # ------------------------------------------------------------------ #
+    # Section 6: PCI Analysis
+    # ------------------------------------------------------------------ #
+    def _pci_analysis(self, result: AnalysisResult) -> None:
+        # Collect unique PCIs per tech
+        pci_map: Dict[str, set] = defaultdict(set)
+        for s in result.signal_samples:
+            if s.pci is not None:
+                pci_map[s.tech].add(s.pci)
+
+        if not pci_map:
+            return
+
+        print(f"\n{C.BOLD}{C.CYAN}── PCI Analysis ──{C.RESET}\n")
+
+        all_pcis: List[Tuple[str, int]] = []
+        for tech in ["LTE", "NR"]:
+            if tech not in pci_map:
+                continue
+            pcis = sorted(pci_map[tech])
+            all_pcis.extend((tech, p) for p in pcis)
+
+            print(f"  {C.BOLD}{tech} PCIs ({len(pcis)}):{C.RESET}")
+            print(f"    {'PCI':<6} {'mod3':<6} {'mod6':<6} {'mod30':<6}")
+            print(f"    {'─' * 24}")
+            for p in pcis:
+                print(f"    {p:<6} {p % 3:<6} {p % 6:<6} {p % 30:<6}")
+
+        # Collision detection: PCIs with same mod-3 (PSS) or mod-6 (SSS)
+        print(f"\n  {C.BOLD}PCI Collision/Confusion Risk:{C.RESET}")
+        collisions_found = False
+
+        for tech in ["LTE", "NR"]:
+            if tech not in pci_map:
+                continue
+            pcis = sorted(pci_map[tech])
+            if len(pcis) < 2:
+                continue
+
+            # mod-3 groups (PSS collision)
+            mod3_groups: Dict[int, List[int]] = defaultdict(list)
+            for p in pcis:
+                mod3_groups[p % 3].append(p)
+
+            for mod_val, group in sorted(mod3_groups.items()):
+                if len(group) > 1:
+                    collisions_found = True
+                    print(f"    {C.YELLOW}{tech} mod-3={mod_val} (PSS collision risk): PCI {group}{C.RESET}")
+
+            # mod-6 groups (SSS confusion)
+            mod6_groups: Dict[int, List[int]] = defaultdict(list)
+            for p in pcis:
+                mod6_groups[p % 6].append(p)
+
+            for mod_val, group in sorted(mod6_groups.items()):
+                if len(group) > 1:
+                    collisions_found = True
+                    print(f"    {C.YELLOW}{tech} mod-6={mod_val} (SSS confusion risk): PCI {group}{C.RESET}")
+
+        if not collisions_found:
+            print(f"    {C.GREEN}No collision/confusion risks detected among observed PCIs.{C.RESET}")
+
+        print()
+
+    # ------------------------------------------------------------------ #
+    # Section 7: Interference vs Coverage Analysis
+    # ------------------------------------------------------------------ #
+    def _interference_analysis(self, result: AnalysisResult) -> None:
+        # Need samples with both RSRP and SINR
+        paired = [
+            s for s in result.signal_samples
+            if s.rsrp is not None and s.sinr is not None
+        ]
+        if not paired:
+            return
+
+        print(f"\n{C.BOLD}{C.CYAN}── Interference vs Coverage Analysis ──{C.RESET}\n")
+
+        for tech in ["LTE", "NR"]:
+            samples = [s for s in paired if s.tech == tech]
+            if not samples:
+                continue
+
+            coverage_limited = [s for s in samples if s.rsrp < -110 and s.sinr < 0]
+            interference_limited = [s for s in samples if s.rsrp >= -100 and s.sinr < 5]
+            good = [s for s in samples if s.rsrp >= -100 and s.sinr >= 10]
+            mid_zone = len(samples) - len(coverage_limited) - len(interference_limited) - len(good)
+
+            total = len(samples)
+            print(f"  {C.BOLD}{tech} ({total} samples with RSRP+SINR):{C.RESET}")
+            for label, cnt, color in [
+                ("Good RF (RSRP>=-100, SINR>=10)", len(good), C.GREEN),
+                ("Interference limited (RSRP>=-100, SINR<5)", len(interference_limited), C.YELLOW),
+                ("Coverage limited (RSRP<-110, SINR<0)", len(coverage_limited), C.RED),
+                ("Transition zone", mid_zone, C.DIM),
+            ]:
+                pct = cnt / total * 100 if total else 0
+                print(f"    {color}{label:<45}{C.RESET} {cnt:>6} ({pct:5.1f}%) {_bar(pct, 20)}")
+
+            if len(interference_limited) > len(coverage_limited) and interference_limited:
+                print(f"    {C.YELLOW}→ Dominant issue: INTERFERENCE — consider PCI/antenna optimization{C.RESET}")
+            elif len(coverage_limited) > len(interference_limited) and coverage_limited:
+                print(f"    {C.RED}→ Dominant issue: COVERAGE — consider power/tilt/new site{C.RESET}")
+            print()
+
+    # ------------------------------------------------------------------ #
+    # Section 8: Coverage Gap Detection
+    # ------------------------------------------------------------------ #
+    def _coverage_gaps(self, result: AnalysisResult) -> None:
+        # Sort signal samples by time, look for periods with RSRP < threshold
+        threshold = -110.0
+        min_gap_sec = 1.0
+
+        samples = sorted(
+            [s for s in result.signal_samples if s.rsrp is not None],
+            key=lambda s: s.timestamp,
+        )
+        if not samples:
+            return
+
+        gaps: List[Dict[str, Any]] = []
+        gap_start = None
+        gap_min_rsrp = 0.0
+        gap_pci = None
+
+        for s in samples:
+            if s.rsrp < threshold:
+                if gap_start is None:
+                    gap_start = s.timestamp
+                    gap_min_rsrp = s.rsrp
+                    gap_pci = s.pci
+                else:
+                    if s.rsrp < gap_min_rsrp:
+                        gap_min_rsrp = s.rsrp
+                        gap_pci = s.pci
+            else:
+                if gap_start is not None:
+                    duration = (s.timestamp - gap_start).total_seconds()
+                    if duration >= min_gap_sec:
+                        gaps.append({
+                            "start": gap_start,
+                            "end": s.timestamp,
+                            "duration": duration,
+                            "min_rsrp": gap_min_rsrp,
+                            "pci": gap_pci,
+                            "tech": s.tech,
+                        })
+                    gap_start = None
+
+        # Close open gap at end
+        if gap_start is not None and samples:
+            duration = (samples[-1].timestamp - gap_start).total_seconds()
+            if duration >= min_gap_sec:
+                gaps.append({
+                    "start": gap_start,
+                    "end": samples[-1].timestamp,
+                    "duration": duration,
+                    "min_rsrp": gap_min_rsrp,
+                    "pci": gap_pci,
+                    "tech": samples[-1].tech,
+                })
+
+        print(f"\n{C.BOLD}{C.CYAN}── Coverage Gap Detection (RSRP < {threshold:.0f} dBm, > {min_gap_sec:.0f}s) ──{C.RESET}\n")
+
+        if not gaps:
+            print(f"  {C.GREEN}No coverage gaps detected.{C.RESET}")
+        else:
+            print(f"  {C.RED}{len(gaps)} coverage gap(s) found:{C.RESET}\n")
+            print(f"  {'#':<4} {'START':<15} {'DURATION':>10} {'MIN RSRP':>10} {'TECH':<5} {'PCI'}")
+            print(f"  {'─' * 55}")
+            total_gap_time = 0.0
+            for i, g in enumerate(gaps, 1):
+                dur_str = StateMachineRenderer._fmt_duration(g["duration"])
+                pci_str = str(g["pci"]) if g["pci"] is not None else ""
+                total_gap_time += g["duration"]
+                print(
+                    f"  {i:<4} {_ts(g['start']):<15} {dur_str:>10} "
+                    f"{g['min_rsrp']:>9.1f}  {g.get('tech', ''):<5} {pci_str}"
+                )
+
+            if result.file_duration:
+                total_sec = result.file_duration.total_seconds()
+                if total_sec > 0:
+                    gap_pct = total_gap_time / total_sec * 100
+                    print(f"\n  Total gap time: {StateMachineRenderer._fmt_duration(total_gap_time)} ({gap_pct:.1f}% of log)")
+
+        print()
+
+    # ------------------------------------------------------------------ #
+    # Section 9: Handover Analysis
+    # ------------------------------------------------------------------ #
+    def _handover_analysis(self, events: List[SignalingEvent], result: AnalysisResult) -> None:  # noqa: C901
+        # Detect cell changes from RRC events with PCI
+        rrc_with_pci = [e for e in events if e.pci is not None and e.layer == "RRC"]
+        if len(rrc_with_pci) < 2:
+            return
+
+        print(f"\n{C.BOLD}{C.CYAN}── Handover Analysis ──{C.RESET}\n")
+
+        # Build handover list
+        handovers: List[Dict[str, Any]] = []
+        prev_pci: Dict[str, Optional[int]] = {}
+        prev_earfcn: Dict[str, Optional[int]] = {}
+
+        for e in rrc_with_pci:
+            tech = e.tech
+            if tech in prev_pci and prev_pci[tech] is not None and e.pci != prev_pci[tech]:
+                ho_type = "intra-freq"
+                if prev_earfcn.get(tech) and e.earfcn and prev_earfcn[tech] != e.earfcn:
+                    ho_type = "inter-freq"
+
+                # Find RSRP at HO time
+                rsrp_at_ho = ""
+                for s in result.signal_samples:
+                    if s.tech == tech and abs((s.timestamp - e.timestamp).total_seconds()) < 2:
+                        if s.rsrp is not None:
+                            rsrp_at_ho = f"{s.rsrp:.1f}"
+                            break
+
+                handovers.append({
+                    "timestamp": e.timestamp,
+                    "tech": tech,
+                    "from_pci": prev_pci[tech],
+                    "to_pci": e.pci,
+                    "type": ho_type,
+                    "band": e.band,
+                    "rsrp": rsrp_at_ho,
+                })
+            prev_pci[tech] = e.pci
+            prev_earfcn[tech] = e.earfcn
+
+        intra = sum(1 for h in handovers if h["type"] == "intra-freq")
+        inter = sum(1 for h in handovers if h["type"] == "inter-freq")
+        print(f"  Total Handovers   : {len(handovers)}")
+        print(f"    Intra-frequency : {intra}")
+        print(f"    Inter-frequency : {inter}")
+
+        # Ping-pong detection: A→B→A within 5 seconds
+        pingpongs = 0
+        for i in range(len(handovers) - 1):
+            h1 = handovers[i]
+            h2 = handovers[i + 1]
+            if (h1["from_pci"] == h2["to_pci"]
+                    and h1["to_pci"] == h2["from_pci"]
+                    and h1["tech"] == h2["tech"]):
+                delta = (h2["timestamp"] - h1["timestamp"]).total_seconds()
+                if delta < 5.0:
+                    pingpongs += 1
+
+        if pingpongs > 0:
+            print(f"    {C.RED}Ping-pong HOs   : {pingpongs} (A→B→A within 5s){C.RESET}")
+        else:
+            print(f"    {C.GREEN}Ping-pong HOs   : 0{C.RESET}")
+
+        # Handover timeline
+        if handovers:
+            print(f"\n  {C.BOLD}Handover Timeline:{C.RESET}")
+            print(f"  {'TIME':<15} {'TECH':<5} {'FROM PCI':<10} {'TO PCI':<10} {'TYPE':<12} {'BAND':<6} {'RSRP'}")
+            print(f"  {'─' * 70}")
+            for h in handovers:
+                print(
+                    f"  {_ts(h['timestamp']):<15} {h['tech']:<5} {h['from_pci']:<10} "
+                    f"{h['to_pci']:<10} {h['type']:<12} {h['band']:<6} {h['rsrp']}"
+                )
+
+        # RSRP distribution at HO trigger
+        ho_rsrp_vals = [float(h["rsrp"]) for h in handovers if h["rsrp"]]
+        if ho_rsrp_vals:
+            print(f"\n  {C.BOLD}RSRP at Handover Trigger:{C.RESET}")
+            print(f"    Min={min(ho_rsrp_vals):.1f}  Avg={mean(ho_rsrp_vals):.1f}  Max={max(ho_rsrp_vals):.1f} dBm")
+
+        print()
+
+
+# ---------------------------------------------------------------------------
 # CSVExporter
 # ---------------------------------------------------------------------------
 
@@ -1304,6 +1934,7 @@ Examples:
   %(prog)s log.hdf --states               # RRC/NAS state machine view
   %(prog)s log.hdf --all                  # Show all views
   %(prog)s log.hdf --csv events.csv       # Export to CSV
+  %(prog)s log.hdf --rf                          # RF optimization dashboard
   %(prog)s log.hdf --timeline --filter-tech nr   # NR-only timeline
   %(prog)s log.hdf --timeline --filter-msg Reestablishment
 """,
@@ -1315,6 +1946,8 @@ Examples:
     parser.add_argument("--failures", action="store_true", help="Failure/reject analysis")
     parser.add_argument("--mobility", action="store_true", help="Cell & handover analysis")
     parser.add_argument("--states", action="store_true", help="RRC/NAS state machine view")
+    parser.add_argument("--rf", action="store_true",
+                        help="RF optimization analysis (coverage, throughput, RACH, PCI, interference)")
     parser.add_argument("--all", action="store_true", help="Show all views")
     parser.add_argument("--csv", nargs="?", const="signaling_events.csv", metavar="OUTFILE",
                         help="Export events to CSV (default: signaling_events.csv)")
@@ -1379,10 +2012,11 @@ Examples:
     show_failures = args.failures or args.all
     show_mobility = args.mobility or args.all
     show_states = args.states or args.all
+    show_rf = args.rf or args.all
 
     # Default to summary if nothing else specified
     if not any([show_summary, show_timeline, show_ladder, show_failures,
-                show_mobility, show_states, args.csv]):
+                show_mobility, show_states, show_rf, args.csv]):
         show_summary = True
 
     # Render views
@@ -1403,6 +2037,9 @@ Examples:
 
     if show_states:
         StateMachineRenderer().render(proc, filtered)
+
+    if show_rf:
+        RFOptimizationView().render(proc, filtered)
 
     # CSV export
     if args.csv:
