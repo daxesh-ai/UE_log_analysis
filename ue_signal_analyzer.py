@@ -269,6 +269,7 @@ _LTE_PROCEDURE_KEYWORDS = {
     "EPS Bearer": "EPS Bearer",
     "PDN": "PDN Connectivity",
     "ESM": "ESM",
+    "RACH": "RACH",
 }
 
 _NR_PROCEDURE_KEYWORDS = {
@@ -292,6 +293,7 @@ _NR_PROCEDURE_KEYWORDS = {
     "5GMM State": "5GMM State",
     "5GMM Status": "5GMM Status",
     "PDU Session": "PDU Session",
+    "RACH": "RACH",
 }
 
 
