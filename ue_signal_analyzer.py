@@ -3471,6 +3471,8 @@ class InteractiveAgent:
         "timing": ["timing", "latency", "delay", "ta ", "timing advance", "rtt"],
         "ca": ["carrier aggregation", " ca ", "ca?", "component carrier", "scell", "pcell", "pcc", "scc", "combo", "aggregat"],
         "dc": ["endc", "en-dc", "nrdc", "nr-dc", "nsa", "dual connect", "anchor", "secondary", "scg", "mcg"],
+        "ladder": ["ladder", "call flow", "message flow", "signaling flow", "sequence", "diagram", "msg flow"],
+        "why": ["why", "explain", "root cause", "reason", "cause", "because", "what caused", "how come"],
     }
 
     def answer(self, question: str) -> str:
@@ -3519,6 +3521,10 @@ class InteractiveAgent:
             parts.append(self._answer_ca())
         if "dc" in matched:
             parts.append(self._answer_dc())
+        if "ladder" in matched:
+            parts.append(self._answer_ladder())
+        if "why" in matched:
+            parts.append(self._answer_why())
         if "fix" in matched:
             parts.append(self._answer_recommendations())
 
@@ -3916,6 +3922,180 @@ class InteractiveAgent:
                 lines.append(f"  RRC Setup interval: avg={mean(deltas):.0f}ms min={min(deltas):.0f}ms")
         return "\n".join(lines)
 
+    def _answer_ladder(self) -> str:
+        """Generate ASCII call flow ladder diagram from signaling events."""
+        lines = [f"{C.BOLD}Call Flow Ladder Diagram:{C.RESET}"]
+        lines.append(f"  {'':>16}  {'UE':<20} {'Network (gNB/eNB)'}")
+        lines.append(f"  {'':>16}  {'|':<20} {'|'}")
+
+        # Collect key signaling events (RRC + NAS + RACH)
+        flow_events: List[Tuple[datetime, str, str, str, str]] = []  # ts, tech, dir, msg, severity
+
+        for e in self.result.rrc_events:
+            if e.event in ("ServingCellInfo",):
+                continue
+            sev = "normal"
+            if "Reject" in e.event or "Failure" in e.event:
+                sev = "critical"
+            elif "Release" in e.event or "Reestablishment" in e.event:
+                sev = "warning"
+            cause = f" ({e.cause})" if e.cause else ""
+            wt = f" [wait={e.wait_time}s]" if e.wait_time else ""
+            flow_events.append((e.timestamp, e.tech, e.direction, f"{e.event}{cause}{wt}", sev))
+
+        for e in self.result.rach_events:
+            if e.msg_stage == "Config":
+                continue
+            sev = "normal"
+            detail = ""
+            if e.preamble_id is not None:
+                detail = f" preamble={e.preamble_id}"
+            if e.timing_advance is not None:
+                detail += f" TA={e.timing_advance}"
+            if e.cause:
+                detail += f" ({e.cause})"
+            flow_events.append((e.timestamp, e.tech, "UL" if e.msg_stage == "Msg1" else "DL",
+                                f"RACH {e.msg_stage}{detail}", sev))
+
+        flow_events.sort(key=lambda x: x[0])
+
+        if not flow_events:
+            lines.append(f"  {C.DIM}No signaling events to display{C.RESET}")
+            return "\n".join(lines)
+
+        # Show last 30 events
+        for ts, tech, direction, msg, sev in flow_events[-30:]:
+            ts_str = _ts(ts)
+            # Truncate long messages
+            if len(msg) > 32:
+                msg = msg[:29] + "..."
+
+            color = C.RED if sev == "critical" else C.YELLOW if sev == "warning" else C.GREEN
+            tech_tag = f"[{tech}]"
+
+            if direction == "UL":
+                arrow = f"  ---[ {msg} ]---->"
+                line = f"  {ts_str}  {color}|{arrow:<42}| {tech_tag}{C.RESET}"
+            elif direction == "DL":
+                arrow = f"<----[ {msg} ]---  "
+                line = f"  {ts_str}  {color}|{' ' * max(42 - len(arrow), 0)}{arrow}| {tech_tag}{C.RESET}"
+            else:
+                line = f"  {ts_str}  {color}|   ({msg}){' ' * max(36 - len(msg), 0)}| {tech_tag}{C.RESET}"
+
+            lines.append(line)
+
+        lines.append(f"  {'':>16}  {'|':<20} {'|'}")
+        lines.append(f"  {C.DIM}Showing last {min(30, len(flow_events))} of {len(flow_events)} signaling events{C.RESET}")
+        return "\n".join(lines)
+
+    def _answer_why(self) -> str:
+        """Root cause explanation — chain events together and explain causality."""
+        lines = [f"{C.BOLD}Root Cause Analysis:{C.RESET}"]
+
+        # Collect all issues
+        issues_found = []
+
+        # --- RLF analysis ---
+        rlf_events = [a for a in self.result.anomalies if a.category == "rlf"]
+        if rlf_events:
+            lines.append(f"\n  {C.RED}{C.BOLD}Why are there Radio Link Failures?{C.RESET}")
+            lines.append(f"  Chain of events:")
+
+            for a in rlf_events[:3]:
+                rsrp_at = self._rsrp_at_time(self.result, a.timestamp, a.tech)
+                lines.append(f"    {_ts(a.timestamp)}: RLF on {a.tech} (RSRP={rsrp_at or 'unknown'})")
+
+            # Check SINR
+            sinr_vals = self.nr_sinr or self.lte_sinr
+            avg_sinr = mean(sinr_vals) if sinr_vals else None
+
+            if avg_sinr is not None and avg_sinr < 0:
+                lines.append(f"\n  {C.BOLD}Root Cause: INTERFERENCE{C.RESET}")
+                lines.append(f"    1. SINR is {avg_sinr:.1f} dB (avg) — below 0 means interference > signal")
+                lines.append(f"    2. UE cannot decode DL control channel (PDCCH) reliably")
+                lines.append(f"    3. T310 timer expires → UE declares Radio Link Failure")
+                if self.ho_count == 0:
+                    lines.append(f"    4. No handover triggered before RLF → {C.RED}A2/A3 thresholds too tight{C.RESET}")
+                    lines.append(f"    Fix: Reduce timeToTrigger or lower A3 offset")
+                issues_found.append("interference_rlf")
+            else:
+                lines.append(f"\n  {C.BOLD}Root Cause: COVERAGE{C.RESET}")
+                lines.append(f"    1. RSRP drops below detection threshold")
+                lines.append(f"    2. UE loses sync with serving cell")
+                lines.append(f"    3. T310 expires → RLF")
+                issues_found.append("coverage_rlf")
+
+        # --- RRC Reject analysis ---
+        rejects = [e for e in self.events if "Reject" in e.message_type and e.layer == "RRC"]
+        if rejects:
+            lines.append(f"\n  {C.RED}{C.BOLD}Why is the network rejecting the UE?{C.RESET}")
+            lines.append(f"  {len(rejects)} RRC Rejects detected. Chain:")
+            lines.append(f"    1. UE sends RRC Setup Request (Msg3) to gNB")
+            lines.append(f"    2. gNB responds with RRC Reject instead of RRC Setup")
+
+            # Check for waitTime
+            rrc_with_wait = [e for e in self.result.rrc_events if e.wait_time is not None]
+            if rrc_with_wait:
+                wt = rrc_with_wait[0].wait_time
+                lines.append(f"    3. Reject includes waitTime={wt}s → {C.RED}Cell is congested{C.RESET}")
+                lines.append(f"    Fix: Check PRACH capacity, max UE count, or access barring config")
+            else:
+                lines.append(f"    3. Possible: cell overloaded, access barring, or UE not authorized")
+            issues_found.append("rrc_reject")
+
+        # --- RACH failure analysis ---
+        if self.lte_msg1 and not self.lte_msg2:
+            lines.append(f"\n  {C.RED}{C.BOLD}Why is LTE RACH failing (0% Msg2)?{C.RESET}")
+            lines.append(f"  {len(self.lte_msg1)} preambles sent, 0 responses. Chain:")
+            lines.append(f"    1. UE sends Msg1 (preamble) on PRACH")
+            lines.append(f"    2. eNB does NOT respond with Msg2 (RAR)")
+            lines.append(f"    Possible causes:")
+            lines.append(f"      a) {C.YELLOW}UL too weak{C.RESET} — preamble power too low, eNB can't hear UE")
+            lines.append(f"      b) {C.YELLOW}Wrong PRACH config{C.RESET} — prachConfigIndex mismatch")
+            lines.append(f"      c) {C.YELLOW}eNB overloaded{C.RESET} — too many RACH attempts, no resources for RAR")
+            lines.append(f"    Fix: Increase preambleInitialReceivedTargetPower in SIB2")
+            issues_found.append("rach_failure")
+
+        # --- SINR/Interference explanation ---
+        if not rlf_events and self.lte_sinr and mean(self.lte_sinr) < 0:
+            lines.append(f"\n  {C.YELLOW}{C.BOLD}Why is SINR so low?{C.RESET}")
+            lines.append(f"  Avg SINR: {mean(self.lte_sinr):.1f} dB")
+            lines.append(f"    Possible causes:")
+            # PCI collision
+            for tech, pcis in [("LTE", self.lte_pcis), ("NR", self.nr_pcis)]:
+                if len(pcis) < 2:
+                    continue
+                mod3: Dict[int, List[int]] = defaultdict(list)
+                for p in pcis:
+                    mod3[p % 3].append(p)
+                for m, grp in mod3.items():
+                    if len(grp) > 1:
+                        lines.append(f"      - {C.RED}PCI collision{C.RESET}: {tech} PCI {grp} share mod-3={m} → PSS interference")
+            lines.append(f"      - External interference (co-channel, adjacent channel)")
+            lines.append(f"      - Antenna tilt/azimuth misconfiguration")
+            issues_found.append("low_sinr")
+
+        # --- No issues ---
+        if not issues_found:
+            lines.append(f"\n  {C.GREEN}No major issues detected in this log.{C.RESET}")
+            lines.append(f"  The network appears to be operating normally.")
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _rsrp_at_time(result: AnalysisResult, ts: datetime, tech: str) -> str:
+        best = None
+        best_delta = 999.0
+        for s in result.signal_samples:
+            if s.tech == tech and s.rsrp is not None:
+                delta = abs((s.timestamp - ts).total_seconds())
+                if delta < best_delta:
+                    best_delta = delta
+                    best = s
+        if best and best_delta < 5.0:
+            return f"{best.rsrp:.1f}dBm"
+        return ""
+
     def _answer_ca(self) -> str:
         """Carrier Aggregation analysis — component carriers, combos, bands."""
         lines = [f"{C.BOLD}Carrier Aggregation (CA) Analysis:{C.RESET}"]
@@ -4105,14 +4285,16 @@ class InteractiveAgent:
         print(f"{'=' * 60}{C.RESET}")
         print(f"  Ask me anything about this log. I'll analyze the data and")
         print(f"  give you an expert answer. Type 'q' to quit.\n")
-        print(f"  Examples:")
+        print(f"  Sample questions:")
+        print(f"    > Give me a summary")
+        print(f"    > Why is it failing?")
+        print(f"    > Show me the call flow")
         print(f"    > What is the signal quality?")
-        print(f"    > Are there any failures?")
-        print(f"    > Show me the cell info")
-        print(f"    > What should we fix?")
+        print(f"    > Bearer info / VoLTE / VoNR?")
+        print(f"    > Show carrier aggregation")
+        print(f"    > EN-DC or NR-DC info?")
         print(f"    > Is there interference?")
-        print(f"    > How is RACH performing?")
-        print(f"    > Give me a summary\n")
+        print(f"    > What should we fix?\n")
 
         # Show quick summary first
         print(self.answer("summary"))

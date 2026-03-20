@@ -115,20 +115,23 @@ python3 ue_signal_analyzer.py log.hdf --agent
   Ask me anything about this log. I'll analyze the data and
   give you an expert answer. Type 'q' to quit.
 
-  Examples:
-    > What is the signal quality?
-    > Are there any failures?
-    > Show me the cell info
-    > What should we fix?
-    > Is there interference?
-    > How is RACH performing?
+  Sample questions:
     > Give me a summary
+    > Why is it failing?
+    > Show me the call flow
+    > What is the signal quality?
+    > Bearer info / VoLTE / VoNR?
+    > Show carrier aggregation
+    > EN-DC or NR-DC info?
+    > Is there interference?
+    > What should we fix?
 ```
 
 ### Supported Topics
 
 | Topic | Example Questions |
 |-------|-------------------|
+| Summary | "Give me a summary", "What happened?", "Overview" |
 | Signal | "What is the RSRP?", "How is signal quality?", "Is coverage weak?" |
 | Cell | "What PCIs are seen?", "Which band?", "What frequency?" |
 | RACH | "How is RACH?", "Any Msg1/Msg2 issues?", "Preamble stats?" |
@@ -142,6 +145,8 @@ python3 ue_signal_analyzer.py log.hdf --agent
 | CA/DC | "Carrier aggregation?", "EN-DC?", "SCell?", "SCG?" |
 | Timing | "Timing advance?", "Latency?" |
 | Config | "SCS?", "TDD/FDD?", "Slot config?" |
+| Ladder | "Show the call flow", "Message sequence?", "Signaling diagram?" |
+| Why | "Why is it failing?", "Root cause?", "What caused the drops?" |
 | Fix | "What should we fix?", "Recommendations?", "Next steps?" |
 
 ### Claude API Agent (separate script)
@@ -351,4 +356,89 @@ ue_signal_analyzer.py
 
 --- [23:02:14.405] RRC Setup (NR, PCI=1) ---
     |            <----[RRCSetup]---              |
+```
+
+### Interactive Agent Session
+```bash
+$ python3 ue_signal_analyzer.py log.hdf --agent
+```
+```
+==============================================================
+  UE Log Interactive Agent
+==============================================================
+  Ask me anything about this log. I'll analyze the data and
+  give you an expert answer. Type 'q' to quit.
+
+  Sample questions:
+    > Give me a summary
+    > Why is it failing?
+    > Show me the call flow
+    > What is the signal quality?
+    > What should we fix?
+
+  > Why is it failing?
+
+  Root Cause Analysis:
+
+    Why is the network rejecting the UE?
+    8 RRC Rejects detected. Chain:
+      1. UE sends RRC Setup Request (Msg3) to gNB
+      2. gNB responds with RRC Reject instead of RRC Setup
+      3. Possible: cell overloaded, access barring, or UE not authorized
+
+    Why are RACH attempts failing?
+    22 RACH failures detected. Chain:
+      1. UE sends RACH Msg1 (preamble) on PRACH
+      2. No Msg2 (RAR) received within ra-ResponseWindow
+      3. UE retransmits with power ramping until maxRetries
+      Fix: Check PRACH config, RACH power offset, noise floor
+
+  > What is the signal quality?
+
+  Signal Quality:
+    NR:  44 RRCSetup / 8 RRCReject on PCI 1
+    LTE: 22 RACH Failures, 3 Detach Requests
+
+  > Show me the call flow
+
+  Call Flow Ladder Diagram:
+                    UE                   Network (gNB/eNB)
+                    |                    |
+    23:01:41.967  |  ---[ Detach Request (SecProt) ]---->  | [LTE]
+    23:01:43.080  |  ---[ RACH Failure ]---->              | [LTE]
+    23:02:14.405  |         <----[ RRCSetup ]---           | [NR]
+    23:19:54.846  |         <----[ RRCReject ]---          | [NR]
+
+  > q
+  Bye!
+```
+
+### Claude API Agent (Advanced)
+```bash
+# Requires Anthropic API key
+export ANTHROPIC_API_KEY=sk-ant-...
+
+# Basic usage
+python3 ../qcom_log_agent.py log.hdf
+
+# With verbose mode (shows data context sent to Claude)
+python3 ../qcom_log_agent.py log.hdf --verbose
+
+# Use a specific model
+python3 ../qcom_log_agent.py log.hdf --model claude-sonnet-4-20250514
+```
+
+Example session:
+```
+> What happened during the call drop at 23:19?
+
+Based on the log data, at 23:19:54 the UE received an RRC Reject from
+the NR cell (PCI 1). This was preceded by multiple RACH failures on
+LTE starting at 23:01, suggesting the UE was having difficulty
+maintaining connectivity. The network appears congested — the UE
+attempted RACH 22 times without success before switching to NR where
+it was rejected 8 times.
+
+Recommendation: Check cell capacity and PRACH configuration on the
+serving NR cell (PCI 1).
 ```
